@@ -1,0 +1,65 @@
+from fastapi import FastAPI, Form
+from pydantic import BaseModel
+import sqlite3, threading, nltk
+from sentence_transformers import SentenceTransformer, util
+from transformers import pipeline
+
+nltk.download('punkt'); nltk.download('wordnet')
+
+# --- DB Setup ---
+DB_PATH = "chatbot.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+c = conn.cursor()
+c.execute("""CREATE TABLE IF NOT EXISTS conversations(
+    id INTEGER PRIMARY KEY, user_id TEXT, message TEXT, response TEXT,
+    intent TEXT, confidence TEXT, source TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+c.execute("""CREATE TABLE IF NOT EXISTS faq(
+    id INTEGER PRIMARY KEY, question TEXT, answer TEXT)""")
+conn.commit()
+
+# --- Models ---
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+gen_pipeline = pipeline("text2text-generation", model="t5-small", device=-1)
+faqs, faq_emb = [], None
+
+def load_faqs():
+    global faqs, faq_emb
+    rows = c.execute("SELECT id,question,answer FROM faq").fetchall()
+    faqs = [{"id":r[0],"q":r[1],"a":r[2]} for r in rows]
+    faq_emb = embed_model.encode([f["q"] for f in faqs], convert_to_tensor=True) if faqs else None
+
+def retrieve(q, top_k=3, thr=0.55):
+    if not faqs: return None, 0.0
+    q_emb = embed_model.encode(q, convert_to_tensor=True)
+    hit = util.semantic_search(q_emb, faq_emb, top_k=top_k)[0][0]
+    return (faqs[hit['corpus_id']]["a"], float(hit['score'])) if hit['score']>=thr else (None, hit['score'])
+
+def generate(prompt): return gen_pipeline(prompt, max_length=150, do_sample=False)[0]['generated_text']
+
+load_faqs()
+app = FastAPI(title="AI Chatbot")
+
+class ChatReq(BaseModel):
+    user_id: str|None = None
+    message: str
+
+@app.get("/health")
+def health(): return {"status":"ok"}
+
+@app.post("/chat")
+def chat(r: ChatReq):
+    ans, score = retrieve(r.message)
+    src = "kb" if ans else "generator"
+    if not ans: ans = generate(f"Answer helpfully:\n\nQ: {r.message}\n\nA:")
+    c.execute("INSERT INTO conversations(user_id,message,response,intent,confidence,source) VALUES (?,?,?,?,?,?)",
+              (r.user_id, r.message, ans, None, str(score), src))
+    conn.commit()
+    return {"response": ans, "source": src, "confidence": score}
+
+@app.post("/admin/add_faq")
+def add_faq(question: str = Form(...), answer: str = Form(...)):
+    c.execute("INSERT INTO faq(question,answer) VALUES (?,?)", (question, answer))
+    conn.commit(); threading.Thread(target=load_faqs).start()
+    return {"status":"ok"}
+
+# Run: uvicorn chatbot:app --reload --port 8000
