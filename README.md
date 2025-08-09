@@ -85,3 +85,4 @@ Response is sent → Interaction is logged into the database for future training
 
 OUTPUT:
 
+<img width="1024" height="1536" alt="Image" src="https://github.com/user-attachments/assets/85faa532-1eb4-479a-9dc1-baa770c64201" />
